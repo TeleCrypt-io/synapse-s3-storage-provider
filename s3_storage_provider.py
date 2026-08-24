@@ -36,16 +36,18 @@ from synapse.rest.media.v1.storage_provider import StorageProvider
 logger = logging.getLogger("synapse.s3")
 
 
-# The list of valid AWS storage class names
-_VALID_STORAGE_CLASSES = (
-    "STANDARD",
-    "REDUCED_REDUNDANCY",
-    "STANDARD_IA",
-    "INTELLIGENT_TIERING",
-)
-
 # Chunk size to use when reading from s3 connection in bytes
 READ_CHUNK_SIZE = 16 * 1024
+
+_REQUIRED_CONFIG_KEYS = frozenset(
+    {
+        "bucket",
+        "endpoint_url",
+        "region_name",
+        "access_key_id",
+        "secret_access_key",
+    }
+)
 
 
 class S3StorageProviderBackend(StorageProvider):
@@ -57,40 +59,20 @@ class S3StorageProviderBackend(StorageProvider):
 
     def __init__(self, hs, config):
         self._module_api: ModuleApi = hs.get_module_api()
-        self.cache_directory = hs.config.media.media_store_path
         self.bucket = config["bucket"]
-        self.prefix = config["prefix"]
-        # A dictionary of extra arguments for uploading files.
-        # See https://boto3.amazonaws.com/v1/documentation/api/latest/reference/customizations/s3.html#boto3.s3.transfer.S3Transfer.ALLOWED_UPLOAD_ARGS
-        # for a list of possible keys.
-        self.extra_args = config["extra_args"]
+        self.extra_args = {}
         self.api_kwargs = {}
 
-        if "region_name" in config:
-            self.api_kwargs["region_name"] = config["region_name"]
-
-        if "endpoint_url" in config:
-            self.api_kwargs["endpoint_url"] = config["endpoint_url"]
-
-        if "access_key_id" in config:
-            self.api_kwargs["aws_access_key_id"] = config["access_key_id"]
-
-        if "secret_access_key" in config:
-            self.api_kwargs["aws_secret_access_key"] = config["secret_access_key"]
-
-        if "session_token" in config:
-            self.api_kwargs["aws_session_token"] = config["session_token"]
-
-        self.api_kwargs["config"] = Config(
-            response_checksum_validation=config.get("response_checksum_validation", "when_required"),
-            request_checksum_calculation=config.get("request_checksum_calculation", "when_required")
-        )
+        self.api_kwargs["region_name"] = config["region_name"]
+        self.api_kwargs["endpoint_url"] = config["endpoint_url"]
+        self.api_kwargs["aws_access_key_id"] = config["access_key_id"]
+        self.api_kwargs["aws_secret_access_key"] = config["secret_access_key"]
+        self.api_kwargs["config"] = Config()
 
         self._s3_client = None
         self._s3_client_lock = threading.Lock()
 
-        threadpool_size = config.get("threadpool_size", 40)
-        self._s3_pool = ThreadPool(name="s3-pool", maxthreads=threadpool_size)
+        self._s3_pool = ThreadPool(name="s3-pool", maxthreads=40)
         self._s3_pool.start()
 
         # Manually stop the thread pool on shutdown. If we don't do this then
@@ -120,16 +102,44 @@ class S3StorageProviderBackend(StorageProvider):
                 self._s3_client = s3 = b3_session.client("s3", **self.api_kwargs)
             return s3
 
+    @property
+    def supports_deletion(self):
+        return True
+
     async def store_file(self, path, file_info):
         """See StorageProvider.store_file"""
 
+        upload_path = getattr(file_info, "upload_path", None)
+        if not upload_path or not isinstance(upload_path, string_types):
+            raise ValueError(
+                "Synapse did not provide the temporary source path for media upload"
+            )
+        if not os.path.isfile(upload_path):
+            raise ValueError("Synapse temporary media source does not exist")
+
         return await self._module_api.defer_to_threadpool(
             self._s3_pool,
-            self._get_s3_client().upload_file,
-            Filename=os.path.join(self.cache_directory, path),
-            Bucket=self.bucket,
-            Key=self.prefix + path,
-            ExtraArgs=self.extra_args,
+            _put_object_from_file,
+            self._get_s3_client(),
+            self.bucket,
+            path,
+            upload_path,
+            self.extra_args,
+        )
+
+    async def delete(self, path, file_info):
+        """Delete the exact object represented by ``path``.
+
+        The storage-provider interface intentionally supplies the canonical
+        Synapse path.  Callers never provide an S3 key or prefix.
+        """
+
+        return await self._module_api.defer_to_threadpool(
+            self._s3_pool,
+            _delete_object,
+            self._get_s3_client(),
+            self.bucket,
+            path,
         )
 
     async def fetch(self, path, file_info):
@@ -149,7 +159,7 @@ class S3StorageProviderBackend(StorageProvider):
             s3_download_task,
             self._get_s3_client(),
             self.bucket,
-            self.prefix + path,
+            path,
             self.extra_args,
             d,
         )
@@ -166,43 +176,65 @@ class S3StorageProviderBackend(StorageProvider):
 
         The returned value is passed into the constructor.
 
-        In this case we return a dict with fields, `bucket`, `prefix` and `storage_class`
+        The TeleCrypt runtime deliberately supports one exact configuration
+        shape. Optional legacy settings can change the bucket contract or
+        introduce capabilities that the deployment does not verify.
         """
-        bucket = config["bucket"]
-        prefix = config.get("prefix", "")
-        storage_class = config.get("storage_class", "STANDARD")
-
-        assert isinstance(bucket, string_types)
-        assert storage_class in _VALID_STORAGE_CLASSES
-
-        result = {
-            "bucket": bucket,
-            "prefix": prefix,
-            "extra_args": {"StorageClass": storage_class},
-        }
-
-        if "region_name" in config:
-            result["region_name"] = str(config["region_name"])
-
-        if "endpoint_url" in config:
-            result["endpoint_url"] = config["endpoint_url"]
-
-        if "access_key_id" in config:
-            result["access_key_id"] = str(config["access_key_id"])
-
-        if "secret_access_key" in config:
-            result["secret_access_key"] = config["secret_access_key"]
-
-        if "session_token" in config:
-            result["session_token"] = config["session_token"]
-
-        if "sse_customer_key" in config:
-            result["extra_args"]["SSECustomerKey"] = config["sse_customer_key"]
-            result["extra_args"]["SSECustomerAlgorithm"] = config.get(
-                "sse_customer_algo", "AES256"
+        unexpected_keys = set(config) - _REQUIRED_CONFIG_KEYS
+        missing_keys = _REQUIRED_CONFIG_KEYS - set(config)
+        if unexpected_keys or missing_keys:
+            raise ValueError(
+                "S3 provider config must contain exactly bucket, endpoint_url, "
+                "region_name, access_key_id, and secret_access_key; "
+                "unexpected=%s missing=%s"
+                % (sorted(unexpected_keys), sorted(missing_keys))
             )
 
-        return result
+        for key in _REQUIRED_CONFIG_KEYS:
+            if not isinstance(config[key], string_types) or not config[key]:
+                raise ValueError(
+                    "S3 provider config %s must be a non-empty string" % key
+                )
+
+        if config["endpoint_url"] != "https://s3.telecrypt.io":
+            raise ValueError("S3 provider endpoint_url must be https://s3.telecrypt.io")
+
+        return {
+            "bucket": config["bucket"],
+            "endpoint_url": config["endpoint_url"],
+            "region_name": config["region_name"],
+            "access_key_id": config["access_key_id"],
+            "secret_access_key": config["secret_access_key"],
+        }
+
+
+def _put_object_from_file(s3_client, bucket, key, source_path, extra_args):
+    """Upload one file with one ordinary S3 PutObject request.
+
+    ``upload_file`` is deliberately not used here: boto3's managed transfer
+    implementation may switch to multipart uploads for larger files. The
+    caller has already validated the source path and canonical key through
+    Synapse's storage-provider interface.
+    """
+
+    with open(source_path, "rb") as source:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=source,
+            **extra_args,
+        )
+
+
+def _delete_object(s3_client, bucket, key):
+    """Delete one exact S3 object, treating an absent object as success."""
+
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    except botocore.exceptions.ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code")
+        if error_code not in ("404", "NoSuchKey", "NotFound"):
+            raise
 
 
 def s3_download_task(s3_client, bucket, key, extra_args, deferred):

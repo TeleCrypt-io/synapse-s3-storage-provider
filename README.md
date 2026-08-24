@@ -21,46 +21,26 @@ media_storage_providers:
   store_synchronous: True
   config:
     bucket: <S3_BUCKET_NAME>
-    # All of the below options are optional, for use with non-AWS S3-like
-    # services, or to specify access tokens here instead of some external method.
     region_name: <S3_REGION_NAME>
-    endpoint_url: <S3_LIKE_SERVICE_ENDPOINT_URL>
+    endpoint_url: https://s3.telecrypt.io
     access_key_id: <S3_ACCESS_KEY_ID>
     secret_access_key: <S3_SECRET_ACCESS_KEY>
-    session_token: <S3_SESSION_TOKEN>
-
-    # Server Side Encryption for Customer-provided keys
-    #sse_customer_key: <S3_SSEC_KEY>
-    # Your SSE-C algorithm is very likely AES256
-    # Default is AES256.
-    #sse_customer_algo: <S3_SSEC_ALGO>
-
-    # The object storage class used when uploading files to the bucket.
-    # Default is STANDARD.
-    #storage_class: "STANDARD_IA"
-
-    # Prefix for all media in bucket, can't be changed once media has been uploaded
-    # Useful if sharing the bucket between Synapses
-    # Blank if not provided
-    #prefix: "prefix/to/files/in/bucket"
-
-    # The maximum number of concurrent threads which will be used to connect
-    # to S3. Each thread manages a single connection. Default is 40.
-    #
-    #threadpool_size: 20
-
-    # Set request_checksum_calculation or response_checksum_validation. 
-    # Depending on your S3 provider you may need to set these values,
-    # especially if you are using a self-hosted system that does not
-    # support the functionality provided by AWS.
-    # Default is 'when_required'
-    # request_checksum_calculation: "when_supported" | "when_required"
-    # response_checksum_validation: "when_supported" | "when_required"
-    
 ```
+
+The TeleCrypt fork accepts exactly these five values in `config`, and the
+endpoint is fixed to `https://s3.telecrypt.io`. Legacy prefixes, session
+tokens, encryption settings, storage classes, checksum settings, and unknown
+keys are rejected at startup.
 
 This module uses `boto3`, and so the credentials should be specified as
 described [here](https://boto3.readthedocs.io/en/latest/guide/configuration.html#guide-configuration).
+
+TeleCrypt's pinned Synapse fork passes the disposable upload source through
+`FileInfo.upload_path`. The TeleCrypt release of this provider reads that path
+directly and performs one ordinary S3 `PutObject`; it does not use boto3's
+managed `upload_file` transfer or initiate multipart uploads. The optional
+storage-provider deletion hook deletes the exact canonical key and treats an
+already absent object as success.
 
 Regular cleanup job
 -------------------

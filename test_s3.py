@@ -26,11 +26,100 @@ if is_py2:
 else:
     from queue import Queue
 
+from tempfile import NamedTemporaryFile
 from threading import Event, Thread
 
+from botocore.exceptions import ClientError
 from mock import Mock
 
-from s3_storage_provider import _stream_to_producer, _S3Responder, _ProducerStatus
+from s3_storage_provider import (
+    _delete_object,
+    _put_object_from_file,
+    _stream_to_producer,
+    _S3Responder,
+    _ProducerStatus,
+    S3StorageProviderBackend,
+)
+
+
+class S3ObjectOperationTestCase(unittest.TestCase):
+    def test_store_uses_one_put_object_from_the_given_source(self):
+        client = Mock()
+        observed = {}
+
+        def put_object(**kwargs):
+            observed.update(kwargs)
+            observed["body"] = kwargs["Body"].read()
+
+        client.put_object.side_effect = put_object
+
+        with NamedTemporaryFile() as source:
+            source.write(b"temporary media")
+            source.flush()
+            _put_object_from_file(
+                client,
+                "media-bucket",
+                "media/local/abc",
+                source.name,
+                {},
+            )
+
+        self.assertEqual(observed["Bucket"], "media-bucket")
+        self.assertEqual(observed["Key"], "media/local/abc")
+        self.assertEqual(observed["body"], b"temporary media")
+        client.put_object.assert_called_once()
+        client.upload_file.assert_not_called()
+
+    def test_delete_uses_the_exact_key(self):
+        client = Mock()
+
+        _delete_object(client, "media-bucket", "media/local/abc")
+
+        client.delete_object.assert_called_once_with(
+            Bucket="media-bucket", Key="media/local/abc"
+        )
+
+    def test_delete_treats_absent_object_as_success(self):
+        client = Mock()
+        client.delete_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "DeleteObject"
+        )
+
+        _delete_object(client, "media-bucket", "media/local/abc")
+
+    def test_delete_propagates_other_errors(self):
+        client = Mock()
+        client.delete_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "DeleteObject"
+        )
+
+        with self.assertRaises(ClientError):
+            _delete_object(client, "media-bucket", "media/local/abc")
+
+
+class S3ConfigTestCase(unittest.TestCase):
+    def setUp(self):
+        self.config = {
+            "bucket": "telecrypt-test",
+            "endpoint_url": "https://s3.telecrypt.io",
+            "region_name": "telecrypt",
+            "access_key_id": "access",
+            "secret_access_key": "secret",
+        }
+
+    def test_requires_the_exact_runtime_config(self):
+        parsed = S3StorageProviderBackend.parse_config(self.config)
+        self.assertNotIn("prefix", parsed)
+
+    def test_rejects_legacy_or_unknown_config(self):
+        legacy = dict(self.config, prefix="media/")
+        with self.assertRaises(ValueError):
+            S3StorageProviderBackend.parse_config(legacy)
+
+    def test_rejects_noncanonical_endpoint(self):
+        noncanonical = dict(self.config, endpoint_url="https://s3.example.invalid")
+        with self.assertRaises(ValueError):
+            S3StorageProviderBackend.parse_config(noncanonical)
 
 
 class StreamingProducerTestCase(unittest.TestCase):
