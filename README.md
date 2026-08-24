@@ -17,7 +17,7 @@ Example of entry in synapse config:
 media_storage_providers:
 - module: s3_storage_provider.S3StorageProviderBackend
   store_local: True
-  store_remote: True
+  store_remote: False
   store_synchronous: True
   config:
     bucket: <S3_BUCKET_NAME>
