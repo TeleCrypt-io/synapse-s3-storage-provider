@@ -94,6 +94,45 @@ class S3ObjectOperationTestCase(unittest.TestCase):
         client.put_object.assert_called_once()
         client.upload_file.assert_not_called()
 
+    def test_exact_128_mib_uses_one_non_multipart_put_object(self):
+        client = Mock()
+        observed = {}
+        exact_size = 128 * 1024 * 1024
+
+        def put_object(**kwargs):
+            observed["size"] = os.fstat(kwargs["Body"].fileno()).st_size
+
+        client.put_object.side_effect = put_object
+
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            os.makedirs(staging_tmp)
+            source_path = os.path.join(staging_tmp, "exact-128-mib")
+            with open(source_path, "wb") as source:
+                source.truncate(exact_size)
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                _put_object_from_file(
+                    client,
+                    "media-bucket",
+                    "media/local/exact-128-mib",
+                    source_path,
+                    {},
+                )
+
+        self.assertEqual(observed["size"], exact_size)
+        client.put_object.assert_called_once()
+        client.upload_file.assert_not_called()
+        client.create_multipart_upload.assert_not_called()
+        client.upload_part.assert_not_called()
+        client.complete_multipart_upload.assert_not_called()
+        client.abort_multipart_upload.assert_not_called()
+
     def test_rejects_source_in_persistent_media_compatibility_path(self):
         with TemporaryDirectory() as root:
             staging = os.path.join(root, "staging")
