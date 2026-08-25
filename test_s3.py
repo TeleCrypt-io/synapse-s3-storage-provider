@@ -18,6 +18,7 @@ from twisted.python.failure import Failure
 from twisted.test.proto_helpers import MemoryReactorClock
 from twisted.trial import unittest
 
+import os
 import sys
 
 is_py2 = sys.version[0] == "2"
@@ -26,15 +27,19 @@ if is_py2:
 else:
     from queue import Queue
 
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryDirectory
 from threading import Event, Thread
 
 from botocore.exceptions import ClientError
-from mock import Mock
+try:
+    from unittest.mock import Mock, patch
+except ImportError:
+    from mock import Mock, patch
 
 from s3_storage_provider import (
     _delete_object,
     _put_object_from_file,
+    _validated_upload_source,
     _stream_to_producer,
     _S3Responder,
     _ProducerStatus,
@@ -53,15 +58,34 @@ class S3ObjectOperationTestCase(unittest.TestCase):
 
         client.put_object.side_effect = put_object
 
-        with NamedTemporaryFile() as source:
-            source.write(b"temporary media")
-            source.flush()
-            _put_object_from_file(
-                client,
-                "media-bucket",
-                "media/local/abc",
-                source.name,
-                {},
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            staging_media = os.path.join(staging, "media")
+            os.makedirs(staging_tmp)
+            os.makedirs(staging_media)
+            source_path = os.path.join(staging_tmp, "upload")
+            with open(source_path, "wb") as source:
+                source.write(b"temporary media")
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                _put_object_from_file(
+                    client,
+                    "media-bucket",
+                    "media/local/abc",
+                    source_path,
+                    {},
+                )
+
+            self.assertEqual(
+                os.path.commonpath((staging_tmp, source_path)), staging_tmp
+            )
+            self.assertNotEqual(
+                os.path.commonpath((staging_media, source_path)), staging_media
             )
 
         self.assertEqual(observed["Bucket"], "media-bucket")
@@ -69,6 +93,82 @@ class S3ObjectOperationTestCase(unittest.TestCase):
         self.assertEqual(observed["body"], b"temporary media")
         client.put_object.assert_called_once()
         client.upload_file.assert_not_called()
+
+    def test_rejects_source_in_persistent_media_compatibility_path(self):
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            staging_media = os.path.join(staging, "media")
+            os.makedirs(staging_tmp)
+            os.makedirs(staging_media)
+            source_path = os.path.join(staging_media, "upload")
+            with open(source_path, "wb") as source:
+                source.write(b"must not upload")
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
+                    _put_object_from_file(
+                        Mock(), "media-bucket", "media/local/abc", source_path, {}
+                    )
+
+    def test_rejects_source_outside_staging_mount(self):
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            os.makedirs(staging_tmp)
+            source_path = os.path.join(root, "ambient-upload")
+            with open(source_path, "wb") as source:
+                source.write(b"must not upload")
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
+                    _validated_upload_source(source_path)
+
+    def test_rejects_staging_path_prefix_lookalike(self):
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            lookalike = os.path.join(staging, "tmp2")
+            os.makedirs(staging_tmp)
+            os.makedirs(lookalike)
+            source_path = os.path.join(lookalike, "upload")
+            with open(source_path, "wb") as source:
+                source.write(b"must not upload")
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
+                    _validated_upload_source(source_path)
+
+    def test_rejects_symlink_to_source_outside_staging_mount(self):
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            os.makedirs(staging_tmp)
+            outside_path = os.path.join(root, "outside-upload")
+            with open(outside_path, "wb") as source:
+                source.write(b"must not upload")
+            source_path = os.path.join(staging_tmp, "upload")
+            os.symlink(outside_path, source_path)
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
+                    _validated_upload_source(source_path)
 
     def test_delete_uses_the_exact_key(self):
         client = Mock()

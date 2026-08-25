@@ -39,6 +39,12 @@ logger = logging.getLogger("synapse.s3")
 # Chunk size to use when reading from s3 connection in bytes
 READ_CHUNK_SIZE = 16 * 1024
 
+# Synapse's TeleCrypt runtime uses the fixed disk-backed staging mount for
+# upload payloads. The provider deliberately rejects the persistent
+# compatibility path and the ambient process temporary directory.
+MEDIA_STAGING_ROOT = "/staging"
+MEDIA_STAGING_DIRECTORY = "/staging/tmp"
+
 _REQUIRED_CONFIG_KEYS = frozenset(
     {
         "bucket",
@@ -114,8 +120,7 @@ class S3StorageProviderBackend(StorageProvider):
             raise ValueError(
                 "Synapse did not provide the temporary source path for media upload"
             )
-        if not os.path.isfile(upload_path):
-            raise ValueError("Synapse temporary media source does not exist")
+        upload_path = _validated_upload_source(upload_path)
 
         return await self._module_api.defer_to_threadpool(
             self._s3_pool,
@@ -217,6 +222,7 @@ def _put_object_from_file(s3_client, bucket, key, source_path, extra_args):
     Synapse's storage-provider interface.
     """
 
+    source_path = _validated_upload_source(source_path)
     with open(source_path, "rb") as source:
         s3_client.put_object(
             Bucket=bucket,
@@ -224,6 +230,37 @@ def _put_object_from_file(s3_client, bucket, key, source_path, extra_args):
             Body=source,
             **extra_args,
         )
+
+
+def _validated_upload_source(source_path):
+    """Return a real temporary source path beneath the fixed staging directory."""
+
+    if not isinstance(source_path, string_types):
+        raise ValueError("Synapse temporary media source path must be a string")
+
+    staging_root = os.path.realpath(MEDIA_STAGING_ROOT)
+    staging_directory = os.path.realpath(MEDIA_STAGING_DIRECTORY)
+    source = os.path.realpath(source_path)
+
+    try:
+        staging_is_valid = (
+            os.path.commonpath((staging_root, staging_directory)) == staging_root
+        )
+        source_is_staged = (
+            os.path.commonpath((staging_directory, source)) == staging_directory
+        )
+    except ValueError:
+        staging_is_valid = False
+        source_is_staged = False
+
+    if not staging_is_valid or not source_is_staged:
+        raise ValueError(
+            "Synapse temporary media source must be beneath /staging/tmp"
+        )
+    if not os.path.isfile(source):
+        raise ValueError("Synapse temporary media source does not exist")
+
+    return source
 
 
 def _delete_object(s3_client, bucket, key):

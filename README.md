@@ -42,41 +42,16 @@ managed `upload_file` transfer or initiate multipart uploads. The optional
 storage-provider deletion hook deletes the exact canonical key and treats an
 already absent object as success.
 
-Regular cleanup job
--------------------
+The upload source must resolve beneath the runtime's disk-backed
+`/staging/tmp` directory. The persistent compatibility path `/staging/media`,
+the process temporary directory, and symlinks that resolve outside staging are
+rejected before the object is written.
 
-There is additionally a script at `scripts/s3_media_upload` which can be used
-in a regular job to upload content to s3, then delete that from local disk.
-This script can be used in combination with configuration for the storage
-provider to pull media from s3, but upload it asynchronously.
-
-Once the package is installed, the script should be run somewhat like the
-following. We suggest using `tmux` or `screen` as these can take a long time
-on larger servers.
-
-`database.yaml` should contain the keys that would be passed to psycopg2 to
-connect to your database. They can be found in the contents of the
-`database`.`args` parameter in your homeserver.yaml.
-
-More options are available in the command help.
-
-```
-> cd s3_media_upload
-# cache.db will be created if absent. database.yaml is required to
-# contain PG credentials
-> ls
-cache.db database.yaml
-# Update cache from /path/to/media/store looking for files not used
-# within 2 months
-> s3_media_upload update /path/to/media/store 2m
-Syncing files that haven't been accessed since: 2018-10-18 11:06:21.520602
-Synced 0 new rows
-100%|█████████████████████████████████████████████████████████████| 1074/1074 [00:33<00:00, 25.97files/s]
-Updated 0 as deleted
-
-> s3_media_upload upload /path/to/media/store matrix_s3_bucket_name --storage-class STANDARD_IA --delete
-# prepare to wait a long time
-```
+Legacy asynchronous migration/cleanup tooling is intentionally absent from
+the TeleCrypt v1 package. It depended on a local media store, a separate
+database credential file, and managed multipart uploads, which conflict with
+v1's single synchronous `PutObject` path and disposable staging boundary.
+Do not add a cleanup job or run an equivalent command against a v1 bucket.
 
 Packaging and release
 ---------------------
