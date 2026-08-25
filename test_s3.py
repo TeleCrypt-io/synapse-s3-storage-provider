@@ -20,6 +20,7 @@ from twisted.trial import unittest
 
 import os
 import sys
+from types import SimpleNamespace
 
 is_py2 = sys.version[0] == "2"
 if is_py2:
@@ -40,6 +41,7 @@ from s3_storage_provider import (
     _delete_object,
     _put_object_from_file,
     _validated_upload_source,
+    s3_download_task,
     _stream_to_producer,
     _S3Responder,
     _ProducerStatus,
@@ -277,6 +279,117 @@ class S3ObjectOperationTestCase(unittest.TestCase):
 
         with self.assertRaises(ClientError):
             _delete_object(client, "media-bucket", "media/local/abc")
+
+
+class S3BackendWiringTestCase(unittest.TestCase):
+    """Check that the Synapse-facing backend preserves canonical media paths."""
+
+    def _backend(self, module_api):
+        backend = object.__new__(S3StorageProviderBackend)
+        backend._module_api = module_api
+        backend._s3_client = object()
+        backend._s3_pool = object()
+        backend.bucket = "media-bucket"
+        backend.extra_args = {}
+        return backend
+
+    @defer.inlineCallbacks
+    def test_store_file_passes_temporary_source_and_exact_key(self):
+        observed = []
+
+        async def defer_to_threadpool(*args):
+            observed.append(args)
+
+        module_api = SimpleNamespace(defer_to_threadpool=defer_to_threadpool)
+        backend = self._backend(module_api)
+
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            os.makedirs(staging_tmp)
+            source_path = os.path.join(staging_tmp, "upload")
+            with open(source_path, "wb") as source:
+                source.write(b"backend wiring")
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ):
+                result = yield defer.ensureDeferred(
+                    backend.store_file(
+                        "local_content/aa/bb/exact-key",
+                        SimpleNamespace(upload_path=source_path),
+                    )
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0][0], backend._s3_pool)
+        self.assertIs(observed[0][1], _put_object_from_file)
+        self.assertIs(observed[0][2], backend._s3_client)
+        self.assertEqual(
+            observed[0][3:],
+            (
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                source_path,
+                {},
+            ),
+        )
+
+    @defer.inlineCallbacks
+    def test_delete_passes_exact_key_without_prefix_or_headers(self):
+        observed = []
+
+        async def defer_to_threadpool(*args):
+            observed.append(args)
+
+        module_api = SimpleNamespace(defer_to_threadpool=defer_to_threadpool)
+        backend = self._backend(module_api)
+        yield defer.ensureDeferred(
+            backend.delete(
+                "local_content/aa/bb/exact-key",
+                SimpleNamespace(),
+            )
+        )
+
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0][0], backend._s3_pool)
+        self.assertIs(observed[0][1], _delete_object)
+        self.assertIs(observed[0][2], backend._s3_client)
+        self.assertEqual(
+            observed[0][3:], ("media-bucket", "local_content/aa/bb/exact-key")
+        )
+
+    @defer.inlineCallbacks
+    def test_fetch_passes_exact_key_without_prefix(self):
+        observed = []
+
+        def run_in_background(function, *args):
+            observed.append((function, args))
+            args[-1].callback(None)
+
+        module_api = SimpleNamespace(defer_to_threadpool=Mock())
+        backend = self._backend(module_api)
+        with patch("s3_storage_provider.run_in_background", run_in_background):
+            result = yield defer.ensureDeferred(
+                backend.fetch(
+                    "local_content/aa/bb/exact-key",
+                    SimpleNamespace(),
+                )
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0][0], module_api.defer_to_threadpool)
+        self.assertIs(observed[0][1][0], backend._s3_pool)
+        self.assertIs(observed[0][1][1], s3_download_task)
+        self.assertIs(observed[0][1][2], backend._s3_client)
+        self.assertEqual(
+            observed[0][1][3:6],
+            ("media-bucket", "local_content/aa/bb/exact-key", {}),
+        )
 
 
 class S3ConfigTestCase(unittest.TestCase):
