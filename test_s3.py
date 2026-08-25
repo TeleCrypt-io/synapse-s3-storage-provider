@@ -14,29 +14,17 @@
 # limitations under the License.
 
 import os
-import sys
-from types import SimpleNamespace
-
-from twisted.internet import defer
-from twisted.python.failure import Failure
-from twisted.test.proto_helpers import MemoryReactorClock
-from twisted.trial import unittest
-
-is_py2 = sys.version[0] == "2"
-if is_py2:
-    from Queue import Queue
-else:
-    from queue import Queue
-
+from queue import Queue
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from botocore.exceptions import ClientError
 
-try:
-    from unittest.mock import Mock, patch
-except ImportError:
-    from mock import Mock, patch
+from twisted.internet import defer
+from twisted.test.proto_helpers import MemoryReactorClock
+from twisted.trial import unittest
 
 from s3_storage_provider import (
     S3StorageProviderBackend,
