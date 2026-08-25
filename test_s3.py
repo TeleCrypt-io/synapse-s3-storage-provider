@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+from types import SimpleNamespace
+
 from twisted.internet import defer
 from twisted.python.failure import Failure
 from twisted.test.proto_helpers import MemoryReactorClock
 from twisted.trial import unittest
-
-import os
-import sys
-from types import SimpleNamespace
 
 is_py2 = sys.version[0] == "2"
 if is_py2:
@@ -32,20 +32,21 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 
 from botocore.exceptions import ClientError
+
 try:
     from unittest.mock import Mock, patch
 except ImportError:
     from mock import Mock, patch
 
 from s3_storage_provider import (
+    S3StorageProviderBackend,
     _delete_object,
+    _ProducerStatus,
     _put_object_from_file,
+    _S3Responder,
+    _stream_to_producer,
     _validated_upload_source,
     s3_download_task,
-    _stream_to_producer,
-    _S3Responder,
-    _ProducerStatus,
-    S3StorageProviderBackend,
 )
 
 

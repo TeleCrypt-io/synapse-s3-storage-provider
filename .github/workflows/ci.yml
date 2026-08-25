@@ -24,7 +24,11 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.x"
+          # black==19.10.0 depends on typed-ast, which cannot build on the
+          # moving 3.x default (currently 3.14). Keep this legacy lint gate on
+          # the oldest supported runtime; the test matrix below covers newer
+          # interpreters separately.
+          python-version: "3.10"
 
       - name: "Install dependencies"
         run: |
@@ -33,7 +37,7 @@ jobs:
           python -m site
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install --upgrade tox
-      - name: "Run tox lint targets for ${{ matrix.python-version }}"
+      - name: "Run tox lint targets"
         run: "python -m tox -e check_isort,pep8,packaging"
 
   build:
@@ -88,4 +92,3 @@ jobs:
           python -m pip install --upgrade tox
       - name: "Run tox targets for ${{ matrix.python-version }}"
         run: "python -m tox -e py"
-
