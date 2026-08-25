@@ -22,7 +22,7 @@ from unittest.mock import Mock, patch
 
 from botocore.exceptions import ClientError
 
-from twisted.internet import defer
+from twisted.internet import defer, reactor
 from twisted.test.proto_helpers import MemoryReactorClock
 from twisted.trial import unittest
 
@@ -378,6 +378,134 @@ class S3BackendWiringTestCase(unittest.TestCase):
         self.assertEqual(
             observed[0][1][3:6],
             ("media-bucket", "local_content/aa/bb/exact-key", {}),
+        )
+
+
+class S3DownloadTaskTestCase(unittest.TestCase):
+    """Check S3 download lookup and responder setup without a live reactor."""
+
+    @staticmethod
+    def _call_from_thread(callback, *args, **kwargs):
+        callback(*args, **kwargs)
+
+    def test_missing_object_resolves_none(self):
+        client = Mock()
+
+        for error_code in ("404", "NoSuchKey"):
+            with self.subTest(error_code=error_code):
+                client.reset_mock()
+                client.get_object.side_effect = ClientError(
+                    {"Error": {"Code": error_code}}, "GetObject"
+                )
+                deferred = defer.Deferred()
+
+                with patch(
+                    "s3_storage_provider.reactor.callFromThread",
+                    side_effect=self._call_from_thread,
+                ):
+                    s3_download_task(
+                        client,
+                        "media-bucket",
+                        "local_content/aa/bb/exact-key",
+                        {},
+                        deferred,
+                    )
+
+                self.assertIsNone(self.successResultOf(deferred))
+                client.get_object.assert_called_once_with(
+                    Bucket="media-bucket", Key="local_content/aa/bb/exact-key"
+                )
+
+    def test_non_404_failure_errbacks_deferred(self):
+        client = Mock()
+        client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "GetObject"
+        )
+        deferred = defer.Deferred()
+
+        with patch(
+            "s3_storage_provider.reactor.callFromThread",
+            side_effect=self._call_from_thread,
+        ):
+            s3_download_task(
+                client,
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                {},
+                deferred,
+            )
+
+        failure = self.failureResultOf(deferred, ClientError)
+        self.assertEqual(failure.value.response["Error"]["Code"], "AccessDenied")
+        client.get_object.assert_called_once_with(
+            Bucket="media-bucket", Key="local_content/aa/bb/exact-key"
+        )
+
+    def test_success_sets_up_responder_and_streams_body(self):
+        client = Mock()
+        body = Mock()
+        client.get_object.return_value = {"Body": body}
+        deferred = defer.Deferred()
+
+        with patch(
+            "s3_storage_provider.reactor.callFromThread",
+            side_effect=self._call_from_thread,
+        ), patch("s3_storage_provider._stream_to_producer") as stream:
+            s3_download_task(
+                client,
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                {},
+                deferred,
+            )
+
+        responder = self.successResultOf(deferred)
+        self.assertIsInstance(responder, _S3Responder)
+        client.get_object.assert_called_once_with(
+            Bucket="media-bucket", Key="local_content/aa/bb/exact-key"
+        )
+        stream.assert_called_once_with(
+            reactor,
+            responder,
+            body,
+            timeout=90.0,
+        )
+
+    def test_success_passes_customer_encryption_arguments(self):
+        client = Mock()
+        body = Mock()
+        client.get_object.return_value = {"Body": body}
+        deferred = defer.Deferred()
+        extra_args = {
+            "SSECustomerKey": "customer-key",
+            "SSECustomerAlgorithm": "AES256",
+        }
+
+        with patch(
+            "s3_storage_provider.reactor.callFromThread",
+            side_effect=self._call_from_thread,
+        ), patch("s3_storage_provider._stream_to_producer") as stream:
+            s3_download_task(
+                client,
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                extra_args,
+                deferred,
+            )
+
+        responder = self.successResultOf(deferred)
+        self.assertIsInstance(responder, _S3Responder)
+        client.get_object.assert_called_once_with(
+            Bucket="media-bucket",
+            Key="local_content/aa/bb/exact-key",
+            SSECustomerKey="customer-key",
+            SSECustomerAlgorithm="AES256",
+        )
+        stream.assert_called_once_with(
+            reactor,
+            responder,
+            body,
+            timeout=90.0,
         )
 
 
