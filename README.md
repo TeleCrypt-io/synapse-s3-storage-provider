@@ -22,15 +22,16 @@ media_storage_providers:
   config:
     bucket: <S3_BUCKET_NAME>
     region_name: <S3_REGION_NAME>
-    endpoint_url: https://s3.telecrypt.io
+    endpoint_url: https://sss.telecrypt.io
     access_key_id: <S3_ACCESS_KEY_ID>
     secret_access_key: <S3_SECRET_ACCESS_KEY>
 ```
 
 The TeleCrypt fork accepts exactly these five values in `config`, and the
-endpoint is fixed to `https://s3.telecrypt.io`. Legacy prefixes, session
-tokens, encryption settings, storage classes, checksum settings, and unknown
-keys are rejected at startup.
+endpoint is fixed to `https://sss.telecrypt.io`. Endpoint aliases—including
+the former `https://s3.telecrypt.io` spelling—legacy prefixes, session tokens,
+encryption settings, storage classes, checksum settings, and unknown keys are
+rejected at startup. There is no endpoint fallback.
 
 This module uses `boto3`, and so the credentials should be specified as
 described [here](https://boto3.readthedocs.io/en/latest/guide/configuration.html#guide-configuration).

@@ -55,6 +55,8 @@ _REQUIRED_CONFIG_KEYS = frozenset(
     }
 )
 
+_CANONICAL_ENDPOINT_URL = "https://sss.telecrypt.io"
+
 
 class S3StorageProviderBackend(StorageProvider):
     """
@@ -201,8 +203,10 @@ class S3StorageProviderBackend(StorageProvider):
                     "S3 provider config %s must be a non-empty string" % key
                 )
 
-        if config["endpoint_url"] != "https://s3.telecrypt.io":
-            raise ValueError("S3 provider endpoint_url must be https://s3.telecrypt.io")
+        if config["endpoint_url"] != _CANONICAL_ENDPOINT_URL:
+            raise ValueError(
+                "S3 provider endpoint_url must be %s" % _CANONICAL_ENDPOINT_URL
+            )
 
         return {
             "bucket": config["bucket"],

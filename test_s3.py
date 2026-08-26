@@ -513,7 +513,7 @@ class S3ConfigTestCase(unittest.TestCase):
     def setUp(self):
         self.config = {
             "bucket": "telecrypt-test",
-            "endpoint_url": "https://s3.telecrypt.io",
+            "endpoint_url": "https://sss.telecrypt.io",
             "region_name": "telecrypt",
             "access_key_id": "access",
             "secret_access_key": "secret",
@@ -522,6 +522,7 @@ class S3ConfigTestCase(unittest.TestCase):
     def test_requires_the_exact_runtime_config(self):
         parsed = S3StorageProviderBackend.parse_config(self.config)
         self.assertNotIn("prefix", parsed)
+        self.assertEqual(parsed["endpoint_url"], "https://sss.telecrypt.io")
 
     def test_rejects_legacy_or_unknown_config(self):
         legacy = dict(self.config, prefix="media/")
@@ -530,8 +531,13 @@ class S3ConfigTestCase(unittest.TestCase):
 
     def test_rejects_noncanonical_endpoint(self):
         noncanonical = dict(self.config, endpoint_url="https://s3.example.invalid")
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "https://sss.telecrypt.io"):
             S3StorageProviderBackend.parse_config(noncanonical)
+
+    def test_rejects_legacy_s3_endpoint_without_alias_or_fallback(self):
+        legacy = dict(self.config, endpoint_url="https://s3.telecrypt.io")
+        with self.assertRaisesRegex(ValueError, "https://sss.telecrypt.io"):
+            S3StorageProviderBackend.parse_config(legacy)
 
 
 class StreamingProducerTestCase(unittest.TestCase):
