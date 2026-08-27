@@ -237,7 +237,7 @@ def s3_download_task(s3_client, bucket, key, extra_args, deferred):
         deferred (Deferred[_S3Responder|None]): If file exists
             resolved with an _S3Responder instance, if it doesn't
             exist then resolves with None.
-    
+
     Returns:
         A deferred which resolves to an _S3Responder if the file exists.
         Otherwise the deferred fails.
