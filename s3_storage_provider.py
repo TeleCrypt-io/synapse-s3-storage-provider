@@ -160,20 +160,15 @@ class S3StorageProviderBackend(StorageProvider):
         return await make_deferred_yieldable(d)
 
     async def delete(self, path: str, file_info: FileInfo) -> None:
-        def inner():
-            if "SSECustomerKey" in self.extra_args and "SSECustomerAlgorithm" in self.extra_args:
-                self._get_s3_client().delete_object(
-                    Bucket=self.bucket,
-                    Key=self.prefix + path,
-                    SSECustomerKey=self.extra_args["SSECustomerKey"],
-                    SSECustomerAlgorithm=self.extra_args["SSECustomerAlgorithm"],
-                )
-            else:
-                self._get_s3_client().delete_object(
-                    Bucket=self.bucket,
-                    Key=self.prefix + path,
-                )
-        await run_in_background(inner)
+        """Delete the file described by ``file_info`` from S3."""
+
+        return await self._module_api.defer_to_threadpool(
+            self._s3_pool,
+            _delete_object,
+            self._get_s3_client(),
+            self.bucket,
+            self.prefix + path,
+        )
 
     @staticmethod
     def parse_config(config):
@@ -219,6 +214,17 @@ class S3StorageProviderBackend(StorageProvider):
             )
 
         return result
+
+
+def _delete_object(s3_client, bucket, key):
+    """Delete one exact S3 object, treating an absent object as success."""
+
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    except botocore.exceptions.ClientError as error:
+        error_code = str(error.response.get("Error", {}).get("Code"))
+        if error_code not in ("404", "NoSuchKey", "NotFound"):
+            raise
 
 
 def s3_download_task(s3_client, bucket, key, extra_args, deferred):
