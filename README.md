@@ -62,6 +62,20 @@ media_storage_providers:
 This module uses `boto3`, and so the credentials should be specified as
 described [here](https://boto3.readthedocs.io/en/latest/guide/configuration.html#guide-configuration).
 
+Deletion integration coverage
+-----------------------------
+
+The Synapse+MinIO workflow currently covers upload and download only.  A
+coordinated Synapse dependency update is required before it can assert remote
+deletion: the Synapse revision installed by
+`michaelkaye/setup-matrix-synapse` must expose and invoke
+`StorageProvider.delete(path, file_info)`.  Once that revision is pinned, the
+workflow can upload one media item, call Synapse's authenticated
+`DELETE /_synapse/admin/v1/media/<server_name>/<media_id>` endpoint, and then
+assert that the prefixed S3 key is absent from MinIO.  Adding that endpoint
+check before the dependency update would only verify local-media cleanup and
+would not exercise this provider hook.
+
 Regular cleanup job
 -------------------
 

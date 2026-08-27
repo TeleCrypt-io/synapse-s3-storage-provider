@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from threading import Event, Thread
+from types import SimpleNamespace
+
+from botocore.exceptions import ClientError, EndpointConnectionError
 from twisted.internet import defer
 from twisted.python.failure import Failure
 from twisted.test.proto_helpers import MemoryReactorClock
 from twisted.trial import unittest
-
-import sys
 
 is_py2 = sys.version[0] == "2"
 if is_py2:
@@ -26,11 +29,124 @@ if is_py2:
 else:
     from queue import Queue
 
-from threading import Event, Thread
-
 from mock import Mock
 
-from s3_storage_provider import _stream_to_producer, _S3Responder, _ProducerStatus
+from s3_storage_provider import (
+    S3StorageProviderBackend,
+    _delete_object,
+    _stream_to_producer,
+    _S3Responder,
+    _ProducerStatus,
+)
+
+
+class S3DeleteTestCase(unittest.TestCase):
+    def _backend(self, module_api, client, prefix="", extra_args=None):
+        backend = object.__new__(S3StorageProviderBackend)
+        backend._module_api = module_api
+        backend._s3_client = client
+        backend._s3_pool = object()
+        backend.bucket = "media-bucket"
+        backend.prefix = prefix
+        backend.extra_args = extra_args or {}
+        return backend
+
+    @defer.inlineCallbacks
+    def test_delete_uses_exact_bucket_and_key_without_prefix(self):
+        client = Mock()
+        observed = []
+
+        async def defer_to_threadpool(*args, **kwargs):
+            observed.append((args, kwargs))
+            return args[1](*args[2:], **kwargs)
+
+        module_api = SimpleNamespace(defer_to_threadpool=defer_to_threadpool)
+        backend = self._backend(module_api, client)
+
+        yield defer.ensureDeferred(
+            backend.delete("local_content/aa/bb/exact-key", SimpleNamespace())
+        )
+
+        self.assertEqual(len(observed), 1)
+        call_args, call_kwargs = observed[0]
+        self.assertIs(call_args[0], backend._s3_pool)
+        self.assertIs(call_args[1], _delete_object)
+        self.assertEqual(
+            call_args[2:], (client, "media-bucket", "local_content/aa/bb/exact-key")
+        )
+        self.assertEqual(call_kwargs, {})
+        client.delete_object.assert_called_once_with(
+            Bucket="media-bucket", Key="local_content/aa/bb/exact-key"
+        )
+
+    @defer.inlineCallbacks
+    def test_delete_uses_prefix_and_does_not_send_upload_sse_arguments(self):
+        client = Mock()
+        observed = []
+
+        async def defer_to_threadpool(*args, **kwargs):
+            observed.append((args, kwargs))
+            return args[1](*args[2:], **kwargs)
+
+        module_api = SimpleNamespace(defer_to_threadpool=defer_to_threadpool)
+        backend = self._backend(
+            module_api,
+            client,
+            prefix="media/",
+            extra_args={
+                "StorageClass": "STANDARD_IA",
+                "SSECustomerKey": "customer-key",
+                "SSECustomerAlgorithm": "AES256",
+            },
+        )
+
+        yield defer.ensureDeferred(
+            backend.delete("local_content/aa/bb/exact-key", SimpleNamespace())
+        )
+
+        self.assertEqual(len(observed), 1)
+        call_args, call_kwargs = observed[0]
+        self.assertIs(call_args[0], backend._s3_pool)
+        self.assertIs(call_args[1], _delete_object)
+        self.assertEqual(
+            call_args[2:],
+            (client, "media-bucket", "media/local_content/aa/bb/exact-key"),
+        )
+        self.assertEqual(call_kwargs, {})
+        client.delete_object.assert_called_once_with(
+            Bucket="media-bucket", Key="media/local_content/aa/bb/exact-key"
+        )
+
+    def test_delete_treats_all_missing_object_errors_as_success(self):
+        client = Mock()
+
+        for error_code in ("404", "NoSuchKey", "NotFound"):
+            with self.subTest(error_code=error_code):
+                client.reset_mock()
+                client.delete_object.side_effect = ClientError(
+                    {"Error": {"Code": error_code}}, "DeleteObject"
+                )
+
+                _delete_object(client, "media-bucket", "media/local/abc")
+
+                client.delete_object.assert_called_once_with(
+                    Bucket="media-bucket", Key="media/local/abc"
+                )
+
+    def test_delete_propagates_permission_auth_transport_and_other_errors(self):
+        client = Mock()
+        errors = (
+            ClientError({"Error": {"Code": "AccessDenied"}}, "DeleteObject"),
+            ClientError({"Error": {"Code": "InvalidAccessKeyId"}}, "DeleteObject"),
+            EndpointConnectionError(endpoint_url="https://s3.example.invalid"),
+            RuntimeError("unexpected failure"),
+        )
+
+        for error in errors:
+            with self.subTest(error=error):
+                client.delete_object.side_effect = error
+                with self.assertRaises(type(error)):
+                    _delete_object(client, "media-bucket", "media/local/abc")
 
 
 class StreamingProducerTestCase(unittest.TestCase):
