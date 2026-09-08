@@ -21,22 +21,21 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from botocore.exceptions import ClientError
-
-from twisted.internet import defer, reactor
-from twisted.test.proto_helpers import MemoryReactorClock
-from twisted.trial import unittest
-
 from s3_storage_provider import (
     S3StorageProviderBackend,
     _delete_object,
+    _open_validated_upload_source,
     _ProducerStatus,
     _put_object_from_file,
     _S3Responder,
-    _open_validated_upload_source,
     _stream_to_producer,
     _validated_upload_source,
     s3_download_task,
 )
+
+from twisted.internet import defer, reactor
+from twisted.test.proto_helpers import MemoryReactorClock
+from twisted.trial import unittest
 
 
 class S3ObjectOperationTestCase(unittest.TestCase):
