@@ -689,8 +689,9 @@ class StreamingProducerTestCase(unittest.TestCase):
         self.assertEqual("test", self.written)
 
         # We pause producing, but the thread will currently be blocked waiting
-        # to read data, so we wake it up by writing before asserting that
-        # it actually pauses.
+        # to read data, so wait until that read is active before waking it up
+        # and asserting that it actually pauses.
+        self.assertTrue(self.body.reading_event.wait(1.0))
         self.producer.pauseProducing()
         self.body.write(" string")
         self.wait_for_thread()
@@ -850,9 +851,14 @@ class Channel(object):
 
     def __init__(self):
         self._queue = Queue()
+        self.reading_event = Event()
 
     def read(self, _):
-        val = self._queue.get()
+        self.reading_event.set()
+        try:
+            val = self._queue.get()
+        finally:
+            self.reading_event.clear()
         if isinstance(val, Exception):
             raise val
         return val

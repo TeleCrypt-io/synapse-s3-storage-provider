@@ -14,9 +14,9 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/TeleCrypt-io/synapse-s3-storage-provider",
+    license_expression="Apache-2.0",
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: Apache Software License",
     ],
     python_requires=">=3.10, <4",
     py_modules=["s3_storage_provider"],
