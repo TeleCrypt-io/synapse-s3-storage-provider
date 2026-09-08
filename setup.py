@@ -13,7 +13,7 @@ setup(
     description="A storage provider which can fetch and store media in Amazon S3.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/matrix-org/synapse-s3-storage-provider",
+    url="https://github.com/TeleCrypt-io/synapse-s3-storage-provider",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
@@ -21,8 +21,8 @@ setup(
     python_requires=">=3.10, <4",
     py_modules=["s3_storage_provider"],
     install_requires=[
-        "boto3>=1.36.0,<2.0",
-        "botocore>=1.36.0,<2.0",
-        "Twisted",
+        "boto3==1.43.78",
+        "botocore==1.43.78",
+        "Twisted==25.5.0",
     ],
 )

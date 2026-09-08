@@ -32,6 +32,7 @@ from s3_storage_provider import (
     _ProducerStatus,
     _put_object_from_file,
     _S3Responder,
+    _open_validated_upload_source,
     _stream_to_producer,
     _validated_upload_source,
     s3_download_task,
@@ -69,7 +70,6 @@ class S3ObjectOperationTestCase(unittest.TestCase):
                     "media-bucket",
                     "media/local/abc",
                     source_path,
-                    {},
                 )
 
             self.assertEqual(
@@ -113,7 +113,6 @@ class S3ObjectOperationTestCase(unittest.TestCase):
                     "media-bucket",
                     "media/local/exact-128-mib",
                     source_path,
-                    {},
                 )
 
         self.assertEqual(observed["size"], exact_size)
@@ -152,10 +151,10 @@ class S3ObjectOperationTestCase(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "response lost"):
                     _put_object_from_file(
-                        client, "media-bucket", "media/local/retry", source_path, {}
+                        client, "media-bucket", "media/local/retry", source_path
                     )
                 _put_object_from_file(
-                    client, "media-bucket", "media/local/retry", source_path, {}
+                    client, "media-bucket", "media/local/retry", source_path
                 )
 
         self.assertEqual(attempts, [
@@ -185,7 +184,7 @@ class S3ObjectOperationTestCase(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
                     _put_object_from_file(
-                        Mock(), "media-bucket", "media/local/abc", source_path, {}
+                        Mock(), "media-bucket", "media/local/abc", source_path
                     )
 
     def test_rejects_source_outside_staging_mount(self):
@@ -243,6 +242,61 @@ class S3ObjectOperationTestCase(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
                     _validated_upload_source(source_path)
 
+    def test_rejects_source_replaced_with_external_symlink_before_open(self):
+        with TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            staging_tmp = os.path.join(staging, "tmp")
+            os.makedirs(staging_tmp)
+            outside_path = os.path.join(root, "outside-upload")
+            with open(outside_path, "wb") as source:
+                source.write(b"must not upload")
+            source_path = os.path.join(staging_tmp, "upload")
+            with open(source_path, "wb") as source:
+                source.write(b"temporary media")
+
+            original_open = os.open
+            replaced = False
+
+            def replace_before_open(path, flags):
+                nonlocal replaced
+                if path == source_path and not replaced:
+                    os.unlink(source_path)
+                    os.symlink(outside_path, source_path)
+                    replaced = True
+                return original_open(path, flags)
+
+            with patch(
+                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
+            ), patch(
+                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
+            ), patch("s3_storage_provider.os.open", side_effect=replace_before_open):
+                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
+                    _put_object_from_file(
+                        Mock(), "media-bucket", "media/local/abc", source_path
+                    )
+
+            self.assertTrue(replaced)
+
+    def test_preserves_validation_and_descriptor_close_failures(self):
+        source_path = "/staging/tmp/upload"
+        with patch(
+            "s3_storage_provider.os.open", return_value=42
+        ), patch(
+            "s3_storage_provider.os.path.realpath",
+            side_effect=[source_path, "/staging/tmp"],
+        ), patch(
+            "s3_storage_provider.os.fstat",
+            side_effect=RuntimeError("validation failed"),
+        ), patch(
+            "s3_storage_provider.os.close",
+            side_effect=OSError("close failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "validation failed") as raised:
+                _open_validated_upload_source(source_path)
+
+        self.assertIsNotNone(raised.exception.__cause__)
+        self.assertEqual(str(raised.exception.__cause__), "close failed")
+
     def test_delete_uses_the_exact_key(self):
         client = Mock()
 
@@ -253,12 +307,14 @@ class S3ObjectOperationTestCase(unittest.TestCase):
         )
 
     def test_delete_treats_absent_object_as_success(self):
-        client = Mock()
-        client.delete_object.side_effect = ClientError(
-            {"Error": {"Code": "NoSuchKey"}}, "DeleteObject"
-        )
+        for error_code in ("404", "NoSuchKey", "NotFound"):
+            with self.subTest(error_code=error_code):
+                client = Mock()
+                client.delete_object.side_effect = ClientError(
+                    {"Error": {"Code": error_code}}, "DeleteObject"
+                )
 
-        _delete_object(client, "media-bucket", "media/local/abc")
+                _delete_object(client, "media-bucket", "media/local/abc")
 
     def test_delete_propagates_other_errors(self):
         client = Mock()
@@ -279,7 +335,6 @@ class S3BackendWiringTestCase(unittest.TestCase):
         backend._s3_client = object()
         backend._s3_pool = object()
         backend.bucket = "media-bucket"
-        backend.extra_args = {}
         return backend
 
     @defer.inlineCallbacks
@@ -323,7 +378,6 @@ class S3BackendWiringTestCase(unittest.TestCase):
                 "media-bucket",
                 "local_content/aa/bb/exact-key",
                 source_path,
-                {},
             ),
         )
 
@@ -358,6 +412,7 @@ class S3BackendWiringTestCase(unittest.TestCase):
         def run_in_background(function, *args):
             observed.append((function, args))
             args[-1].callback(None)
+            return defer.succeed(None)
 
         module_api = SimpleNamespace(defer_to_threadpool=Mock())
         backend = self._backend(module_api)
@@ -376,9 +431,29 @@ class S3BackendWiringTestCase(unittest.TestCase):
         self.assertIs(observed[0][1][1], s3_download_task)
         self.assertIs(observed[0][1][2], backend._s3_client)
         self.assertEqual(
-            observed[0][1][3:6],
-            ("media-bucket", "local_content/aa/bb/exact-key", {}),
+            observed[0][1][3:5],
+            ("media-bucket", "local_content/aa/bb/exact-key"),
         )
+
+    @defer.inlineCallbacks
+    def test_fetch_forwards_background_failure(self):
+        background = defer.Deferred()
+
+        def run_in_background(function, *args):
+            return background
+
+        backend = self._backend(SimpleNamespace(defer_to_threadpool=Mock()))
+        with patch("s3_storage_provider.run_in_background", run_in_background):
+            fetch = defer.ensureDeferred(
+                backend.fetch(
+                    "local_content/aa/bb/exact-key",
+                    SimpleNamespace(),
+                )
+            )
+            background.errback(RuntimeError("worker failed"))
+
+            with self.assertRaises(RuntimeError):
+                yield fetch
 
 
 class S3DownloadTaskTestCase(unittest.TestCase):
@@ -391,7 +466,7 @@ class S3DownloadTaskTestCase(unittest.TestCase):
     def test_missing_object_resolves_none(self):
         client = Mock()
 
-        for error_code in ("404", "NoSuchKey"):
+        for error_code in ("404", "NoSuchKey", "NotFound"):
             with self.subTest(error_code=error_code):
                 client.reset_mock()
                 client.get_object.side_effect = ClientError(
@@ -407,7 +482,6 @@ class S3DownloadTaskTestCase(unittest.TestCase):
                         client,
                         "media-bucket",
                         "local_content/aa/bb/exact-key",
-                        {},
                         deferred,
                     )
 
@@ -431,7 +505,6 @@ class S3DownloadTaskTestCase(unittest.TestCase):
                 client,
                 "media-bucket",
                 "local_content/aa/bb/exact-key",
-                {},
                 deferred,
             )
 
@@ -440,6 +513,69 @@ class S3DownloadTaskTestCase(unittest.TestCase):
         client.get_object.assert_called_once_with(
             Bucket="media-bucket", Key="local_content/aa/bb/exact-key"
         )
+
+    def test_ordinary_worker_failure_errbacks_deferred(self):
+        client = Mock()
+        client.get_object.side_effect = RuntimeError("endpoint unavailable")
+        deferred = defer.Deferred()
+
+        with patch(
+            "s3_storage_provider.reactor.callFromThread",
+            side_effect=self._call_from_thread,
+        ):
+            s3_download_task(
+                client,
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                deferred,
+            )
+
+        failure = self.failureResultOf(deferred, RuntimeError)
+        self.assertEqual(str(failure.value), "endpoint unavailable")
+
+    def test_invalid_body_errbacks_before_responder_callback(self):
+        client = Mock()
+        client.get_object.return_value = {}
+        deferred = defer.Deferred()
+
+        with patch(
+            "s3_storage_provider.reactor.callFromThread",
+            side_effect=self._call_from_thread,
+        ), patch("s3_storage_provider._stream_to_producer") as stream:
+            s3_download_task(
+                client,
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                deferred,
+            )
+
+        self.failureResultOf(deferred, KeyError)
+        stream.assert_not_called()
+
+    def test_invalid_body_closes_body_and_preserves_close_failure(self):
+        client = Mock()
+        body = Mock()
+        body.read = None
+        body.close.side_effect = RuntimeError("close failed")
+        client.get_object.return_value = {"Body": body}
+        deferred = defer.Deferred()
+
+        with patch(
+            "s3_storage_provider.reactor.callFromThread",
+            side_effect=self._call_from_thread,
+        ):
+            s3_download_task(
+                client,
+                "media-bucket",
+                "local_content/aa/bb/exact-key",
+                deferred,
+            )
+
+        failure = self.failureResultOf(deferred, ValueError)
+        self.assertEqual(str(failure.value), "S3 get_object response has an invalid Body")
+        self.assertIsNotNone(failure.value.__cause__)
+        self.assertEqual(str(failure.value.__cause__), "close failed")
+        body.close.assert_called_once_with()
 
     def test_success_sets_up_responder_and_streams_body(self):
         client = Mock()
@@ -455,7 +591,6 @@ class S3DownloadTaskTestCase(unittest.TestCase):
                 client,
                 "media-bucket",
                 "local_content/aa/bb/exact-key",
-                {},
                 deferred,
             )
 
@@ -463,43 +598,6 @@ class S3DownloadTaskTestCase(unittest.TestCase):
         self.assertIsInstance(responder, _S3Responder)
         client.get_object.assert_called_once_with(
             Bucket="media-bucket", Key="local_content/aa/bb/exact-key"
-        )
-        stream.assert_called_once_with(
-            reactor,
-            responder,
-            body,
-            timeout=90.0,
-        )
-
-    def test_success_passes_customer_encryption_arguments(self):
-        client = Mock()
-        body = Mock()
-        client.get_object.return_value = {"Body": body}
-        deferred = defer.Deferred()
-        extra_args = {
-            "SSECustomerKey": "customer-key",
-            "SSECustomerAlgorithm": "AES256",
-        }
-
-        with patch(
-            "s3_storage_provider.reactor.callFromThread",
-            side_effect=self._call_from_thread,
-        ), patch("s3_storage_provider._stream_to_producer") as stream:
-            s3_download_task(
-                client,
-                "media-bucket",
-                "local_content/aa/bb/exact-key",
-                extra_args,
-                deferred,
-            )
-
-        responder = self.successResultOf(deferred)
-        self.assertIsInstance(responder, _S3Responder)
-        client.get_object.assert_called_once_with(
-            Bucket="media-bucket",
-            Key="local_content/aa/bb/exact-key",
-            SSECustomerKey="customer-key",
-            SSECustomerAlgorithm="AES256",
         )
         stream.assert_called_once_with(
             reactor,
@@ -634,6 +732,89 @@ class StreamingProducerTestCase(unittest.TestCase):
 
         self.failureResultOf(deferred, Exception)
 
+    def test_close_error_fails_the_stream(self):
+        deferred = self.producer.write_to_consumer(self.consumer)
+        self.body.close = Mock(side_effect=Exception("close failed"))
+
+        self.body.finish()
+        self.wait_for_thread()
+
+        failure = self.failureResultOf(deferred, Exception)
+        self.assertEqual(str(failure.value), "close failed")
+
+    def test_preserves_stream_and_body_close_failures(self):
+        deferred = self.producer.write_to_consumer(self.consumer)
+        self.body.close = Mock(side_effect=Exception("close failed"))
+
+        self.body.error(Exception("stream failed"))
+        self.wait_for_thread()
+
+        failure = self.failureResultOf(deferred, Exception)
+        self.assertEqual(str(failure.value), "stream failed")
+        self.assertIsNotNone(failure.value.__cause__)
+        self.assertEqual(str(failure.value.__cause__), "close failed")
+
+    def test_falsey_body_is_closed(self):
+        deferred = self.producer.write_to_consumer(self.consumer)
+        self.body.close = Mock()
+
+        self.body.finish()
+        self.wait_for_thread()
+
+        self.assertTrue(deferred.called)
+        self.body.close.assert_called_once_with()
+
+    def test_consumer_write_failure_stops_and_fails_after_cleanup(self):
+        deferred = self.producer.write_to_consumer(self.consumer)
+        self.consumer.write.side_effect = Exception("consumer failed")
+        self.body.close = Mock()
+
+        self.body.write("test")
+        self.wait_for_thread()
+        self.wait_for_thread()
+
+        failure = self.failureResultOf(deferred, Exception)
+        self.assertEqual(str(failure.value), "consumer failed")
+        self.body.close.assert_called_once_with()
+
+    def test_unregister_failure_is_reported(self):
+        deferred = self.producer.write_to_consumer(self.consumer)
+        self.consumer.unregisterProducer.side_effect = Exception("unregister failed")
+
+        self.body.finish()
+        self.wait_for_thread()
+
+        failure = self.failureResultOf(deferred, Exception)
+        self.assertEqual(str(failure.value), "unregister failed")
+
+    def test_registration_failure_propagates_without_unregistering(self):
+        self.consumer.registerProducer.side_effect = Exception("register failed")
+        self.body.close = Mock(side_effect=Exception("close failed"))
+
+        deferred = self.producer.write_to_consumer(self.consumer)
+
+        self.assertTrue(deferred.called)
+        self.wait_for_thread()
+
+        failure = self.failureResultOf(deferred, Exception)
+        self.assertEqual(str(failure.value), "register failed")
+        self.assertIsNotNone(failure.value.__cause__)
+        self.assertEqual(str(failure.value.__cause__), "close failed")
+        self.body.close.assert_called_once_with()
+        self.consumer.unregisterProducer.assert_not_called()
+
+    def test_cancellation_waits_for_close_and_preserves_close_failure(self):
+        deferred = self.producer.write_to_consumer(self.consumer)
+        self.body.close = Mock(side_effect=Exception("close failed"))
+
+        self.producer.stopProducing()
+        self.wait_for_thread()
+
+        failure = self.failureResultOf(deferred, Exception)
+        self.assertEqual(str(failure.value), "Consumer ask to stop producing")
+        self.assertIsNotNone(failure.value.__cause__)
+        self.assertEqual(str(failure.value.__cause__), "close failed")
+
     def wait_for_thread(self):
         """Wait for something to call `callFromThread` and advance reactor
         """
@@ -688,3 +869,6 @@ class Channel(object):
 
     def close(self):
         pass
+
+    def __bool__(self):
+        return False

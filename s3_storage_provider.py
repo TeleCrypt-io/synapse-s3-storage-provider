@@ -16,9 +16,8 @@
 
 import logging
 import os
+import stat
 import threading
-
-from six import string_types
 
 import boto3
 import botocore
@@ -56,6 +55,7 @@ _REQUIRED_CONFIG_KEYS = frozenset(
 )
 
 _CANONICAL_ENDPOINT_URL = "https://sss.telecrypt.io"
+_S3_NOT_FOUND_CODES = frozenset(("404", "NoSuchKey", "NotFound"))
 
 
 class S3StorageProviderBackend(StorageProvider):
@@ -68,7 +68,6 @@ class S3StorageProviderBackend(StorageProvider):
     def __init__(self, hs, config):
         self._module_api: ModuleApi = hs.get_module_api()
         self.bucket = config["bucket"]
-        self.extra_args = {}
         self.api_kwargs = {}
 
         self.api_kwargs["region_name"] = config["region_name"]
@@ -118,11 +117,10 @@ class S3StorageProviderBackend(StorageProvider):
         """See StorageProvider.store_file"""
 
         upload_path = getattr(file_info, "upload_path", None)
-        if not upload_path or not isinstance(upload_path, string_types):
+        if not upload_path or not isinstance(upload_path, str):
             raise ValueError(
                 "Synapse did not provide the temporary source path for media upload"
             )
-        upload_path = _validated_upload_source(upload_path)
 
         return await self._module_api.defer_to_threadpool(
             self._s3_pool,
@@ -131,7 +129,6 @@ class S3StorageProviderBackend(StorageProvider):
             self.bucket,
             path,
             upload_path,
-            self.extra_args,
         )
 
     async def delete(self, path, file_info):
@@ -160,16 +157,16 @@ class S3StorageProviderBackend(StorageProvider):
         # We do, however, need to wrap in `run_in_background` to ensure that the
         # coroutine returned by `defer_to_threadpool` is used, and therefore
         # actually run.
-        run_in_background(
+        download_deferred = run_in_background(
             self._module_api.defer_to_threadpool,
             self._s3_pool,
             s3_download_task,
             self._get_s3_client(),
             self.bucket,
             path,
-            self.extra_args,
             d,
         )
+        download_deferred.addErrback(_forward_download_failure, d)
 
         # DO await on `d`, as it will resolve once a connection to S3 has been
         # opened. We only want to return to Synapse once we can start streaming
@@ -198,7 +195,7 @@ class S3StorageProviderBackend(StorageProvider):
             )
 
         for key in _REQUIRED_CONFIG_KEYS:
-            if not isinstance(config[key], string_types) or not config[key]:
+            if not isinstance(config[key], str) or not config[key]:
                 raise ValueError(
                     "S3 provider config %s must be a non-empty string" % key
                 )
@@ -217,7 +214,7 @@ class S3StorageProviderBackend(StorageProvider):
         }
 
 
-def _put_object_from_file(s3_client, bucket, key, source_path, extra_args):
+def _put_object_from_file(s3_client, bucket, key, source_path):
     """Upload one file with one ordinary S3 PutObject request.
 
     ``upload_file`` is deliberately not used here: boto3's managed transfer
@@ -227,19 +224,19 @@ def _put_object_from_file(s3_client, bucket, key, source_path, extra_args):
     """
 
     source_path = _validated_upload_source(source_path)
-    with open(source_path, "rb") as source:
+    source = _open_validated_upload_source(source_path)
+    with source:
         s3_client.put_object(
             Bucket=bucket,
             Key=key,
             Body=source,
-            **extra_args,
         )
 
 
 def _validated_upload_source(source_path):
     """Return a real temporary source path beneath the fixed staging directory."""
 
-    if not isinstance(source_path, string_types):
+    if not isinstance(source_path, str):
         raise ValueError("Synapse temporary media source path must be a string")
 
     staging_root = os.path.realpath(MEDIA_STAGING_ROOT)
@@ -267,18 +264,93 @@ def _validated_upload_source(source_path):
     return source
 
 
+def _open_validated_upload_source(source_path):
+    """Open a validated source and verify the object reached through the fd.
+
+    Path validation and opening are separate operations. If the path is
+    replaced between them, validating the path again would still leave a
+    time-of-check/time-of-use window. The descriptor is the upload authority:
+    inspect its resolved target before handing it to boto3, so a replacement
+    symlink or renamed path cannot redirect the bytes outside staging.
+    """
+
+    try:
+        # A replaced FIFO must reach the regular-file check without blocking.
+        file_descriptor = os.open(source_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise ValueError("Synapse temporary media source does not exist") from None
+
+    try:
+        opened_path = os.path.realpath("/proc/self/fd/%d" % file_descriptor)
+        staging_directory = os.path.realpath(MEDIA_STAGING_DIRECTORY)
+        try:
+            is_staged = os.path.commonpath((staging_directory, opened_path)) == staging_directory
+        except ValueError:
+            is_staged = False
+        if not is_staged:
+            raise ValueError(
+                "Synapse temporary media source must be beneath /staging/tmp"
+            )
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise ValueError("Synapse temporary media source is not a regular file")
+        source = os.fdopen(file_descriptor, "rb")
+    except BaseException as error:
+        try:
+            os.close(file_descriptor)
+        except BaseException as close_error:
+            raise error from close_error
+        raise
+
+    return source
+
+
 def _delete_object(s3_client, bucket, key):
     """Delete one exact S3 object, treating an absent object as success."""
 
     try:
         s3_client.delete_object(Bucket=bucket, Key=key)
     except botocore.exceptions.ClientError as error:
-        error_code = error.response.get("Error", {}).get("Code")
-        if error_code not in ("404", "NoSuchKey", "NotFound"):
+        if not _is_s3_not_found_error(error):
             raise
 
 
-def s3_download_task(s3_client, bucket, key, extra_args, deferred):
+def _is_s3_not_found_error(error):
+    """Return whether an S3 operation reported an absent object."""
+
+    return error.response.get("Error", {}).get("Code") in _S3_NOT_FOUND_CODES
+
+
+def _callback_download_deferred(deferred, result):
+    """Settle the fetch Deferred once, preserving any earlier result."""
+
+    if not deferred.called:
+        deferred.callback(result)
+
+
+def _errback_download_deferred(deferred, failure):
+    """Fail the fetch Deferred once, preserving any earlier result."""
+
+    if not deferred.called:
+        deferred.errback(failure)
+
+
+def _forward_download_failure(failure, deferred):
+    """Forward a worker/background failure unless fetch already settled."""
+
+    _errback_download_deferred(deferred, failure)
+    return None
+
+
+def _append_failure_cause(failure, additional_error):
+    """Keep an additional operation or cleanup failure on the same chain."""
+
+    current_error = failure.value
+    while current_error.__cause__ is not None:
+        current_error = current_error.__cause__
+    current_error.__cause__ = additional_error
+
+
+def s3_download_task(s3_client, bucket, key, deferred):
     """Attempts to download a file from S3.
 
     Args:
@@ -296,28 +368,42 @@ def s3_download_task(s3_client, bucket, key, extra_args, deferred):
     logger.info("Fetching %s from S3", key)
 
     try:
-        if "SSECustomerKey" in extra_args and "SSECustomerAlgorithm" in extra_args:
-            resp = s3_client.get_object(
-                Bucket=bucket,
-                Key=key,
-                SSECustomerKey=extra_args["SSECustomerKey"],
-                SSECustomerAlgorithm=extra_args["SSECustomerAlgorithm"],
-            )
-        else:
-            resp = s3_client.get_object(Bucket=bucket, Key=key)
+        resp = s3_client.get_object(Bucket=bucket, Key=key)
 
     except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] in ("404", "NoSuchKey",):
+        if _is_s3_not_found_error(e):
             logger.info("Media %s not found in S3", key)
-            reactor.callFromThread(deferred.callback, None)
+            reactor.callFromThread(_callback_download_deferred, deferred, None)
             return
 
-        reactor.callFromThread(deferred.errback, Failure())
+        reactor.callFromThread(_errback_download_deferred, deferred, Failure())
+        return
+    except Exception:
+        reactor.callFromThread(_errback_download_deferred, deferred, Failure())
+        return
+
+    body = None
+    try:
+        body = resp["Body"]
+        if not callable(getattr(body, "read", None)) or not callable(
+            getattr(body, "close", None)
+        ):
+            raise ValueError("S3 get_object response has an invalid Body")
+    except Exception:
+        failure = Failure()
+        try:
+            if body is not None:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+        except Exception as close_error:
+            _append_failure_cause(failure, close_error)
+        reactor.callFromThread(_errback_download_deferred, deferred, failure)
         return
 
     producer = _S3Responder()
-    reactor.callFromThread(deferred.callback, producer)
-    _stream_to_producer(reactor, producer, resp["Body"], timeout=90.0)
+    reactor.callFromThread(_callback_download_deferred, deferred, producer)
+    _stream_to_producer(reactor, producer, body, timeout=90.0)
 
 
 def _stream_to_producer(reactor, producer, body, status=None, timeout=None):
@@ -366,11 +452,17 @@ def _stream_to_producer(reactor, producer, body, status=None, timeout=None):
             reactor.callFromThread(producer._write, chunk)
 
     except Exception:
-        reactor.callFromThread(producer._error, Failure())
+        producer._record_failure(Failure())
     finally:
-        reactor.callFromThread(producer._finish)
-        if body:
-            body.close()
+        try:
+            if body is not None:
+                body.close()
+        except Exception:
+            producer._record_failure(Failure())
+        if producer._has_failure():
+            reactor.callFromThread(producer._error)
+        else:
+            reactor.callFromThread(producer._finish)
 
 
 class _S3Responder(Responder):
@@ -390,6 +482,26 @@ class _S3Responder(Responder):
         # The deferred returned by write_to_consumer, which should resolve when
         # all the data has been written (or there has been a fatal error).
         self.deferred = defer.Deferred()
+        self._failure = None
+        self._failure_lock = threading.Lock()
+        self._producer_registered = False
+
+    def _record_failure(self, failure):
+        """Record one failure while preserving any earlier failure."""
+
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = failure
+            else:
+                _append_failure_cause(self._failure, failure.value)
+
+    def _has_failure(self):
+        with self._failure_lock:
+            return self._failure is not None
+
+    def _get_failure(self):
+        with self._failure_lock:
+            return self._failure
 
     def write_to_consumer(self, consumer):
         """See Responder.write_to_consumer
@@ -397,7 +509,18 @@ class _S3Responder(Responder):
         self.consumer = consumer
         # We are a IPushProducer, so we start producing immediately until we
         # get a pauseProducing or stopProducing
-        consumer.registerProducer(self, True)
+        try:
+            consumer.registerProducer(self, True)
+        except Exception:
+            failure = Failure()
+            self._record_failure(failure)
+            self.consumer = None
+            self.stop_event.set()
+            self.wakeup_event.set()
+            if not self.deferred.called:
+                self.deferred.errback(failure)
+            return make_deferred_yieldable(self.deferred)
+        self._producer_registered = True
         self.wakeup_event.set()
         return make_deferred_yieldable(self.deferred)
 
@@ -420,37 +543,68 @@ class _S3Responder(Responder):
         """See IPushProducer.stopProducing
         """
         # The consumer wants no more data ever, signal _S3DownloadThread
+        if not self.stop_event.is_set():
+            self._record_failure(Failure(Exception("Consumer ask to stop producing")))
         self.stop_event.set()
         self.wakeup_event.set()
-        if not self.deferred.called:
-            self.deferred.errback(Exception("Consumer ask to stop producing"))
 
     def _write(self, chunk):
         """Writes the chunk of data to consumer. Called by _S3DownloadThread.
         """
         if self.consumer and not self.stop_event.is_set():
-            self.consumer.write(chunk)
+            try:
+                self.consumer.write(chunk)
+            except Exception:
+                self._record_failure(Failure())
+                self.stop_event.set()
+                self.wakeup_event.set()
 
-    def _error(self, failure):
+    def _error(self):
         """Called when a fatal error occured while getting data. Called by
         _S3DownloadThread.
         """
-        if self.consumer:
-            self.consumer.unregisterProducer()
+        failure = self._get_failure()
+        if self.consumer is not None and self._producer_registered:
+            try:
+                self.consumer.unregisterProducer()
+            except Exception as cleanup_error:
+                if failure is None:
+                    failure = Failure()
+                else:
+                    _append_failure_cause(failure, cleanup_error)
+            finally:
+                self.consumer = None
+                self._producer_registered = False
+        else:
             self.consumer = None
 
-        if not self.deferred.called:
+        if failure is not None and not self.deferred.called:
             self.deferred.errback(failure)
 
     def _finish(self):
         """Called when there is no more data to write. Called by _S3DownloadThread.
         """
-        if self.consumer:
-            self.consumer.unregisterProducer()
+        failure = self._get_failure()
+        if self.consumer is not None and self._producer_registered:
+            try:
+                self.consumer.unregisterProducer()
+            except Exception:
+                cleanup_error = Failure()
+                if failure is None:
+                    failure = cleanup_error
+                else:
+                    _append_failure_cause(failure, cleanup_error.value)
+            finally:
+                self.consumer = None
+                self._producer_registered = False
+        else:
             self.consumer = None
 
         if not self.deferred.called:
-            self.deferred.callback(None)
+            if failure is None:
+                self.deferred.callback(None)
+            else:
+                self.deferred.errback(failure)
 
 
 class _ProducerStatus(object):
