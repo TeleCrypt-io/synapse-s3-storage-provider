@@ -23,11 +23,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@v7.0.0 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           # Keep the lint/packaging gate on the oldest supported runtime; the
           # test matrix below covers newer interpreters separately.
@@ -49,11 +49,11 @@ jobs:
     name: "Build and check Python package"
     runs-on: "ubuntu-24.04"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@v7.0.0 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           python-version: "3.14"
 
@@ -77,11 +77,11 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@v7.0.0 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           python-version: "${{ matrix.python-version }}"
 

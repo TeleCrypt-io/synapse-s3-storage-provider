@@ -21,11 +21,9 @@ jobs:
       security-events: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7.0.1 # zizmor: ignore[unpinned-uses] project policy requires exact release versions
         with:
           persist-credentials: false
 
       - name: Run zizmor 🌈
-        uses: zizmorcore/zizmor-action@v0.6.0
-        with:
-          config: .github/zizmor.yml
+        uses: zizmorcore/zizmor-action@v0.6.0 # zizmor: ignore[unpinned-uses] project policy requires exact release versions

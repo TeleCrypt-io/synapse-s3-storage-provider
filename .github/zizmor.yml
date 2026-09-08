@@ -1,7 +1,0 @@
-rules:
-  unpinned-uses:
-    config:
-      policies:
-        "actions/checkout@v7.0.1": ref-pin
-        "actions/setup-python@v7.0.0": ref-pin
-        "zizmorcore/zizmor-action@v0.6.0": ref-pin
