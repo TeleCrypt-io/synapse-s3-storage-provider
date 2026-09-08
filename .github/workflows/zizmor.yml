@@ -9,6 +9,11 @@ on:
 
 permissions: {}
 
+env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
 jobs:
   zizmor:
     runs-on: ubuntu-24.04
@@ -22,3 +27,5 @@ jobs:
 
       - name: Run zizmor 🌈
         uses: zizmorcore/zizmor-action@v0.6.0
+        with:
+          config: .github/zizmor.yml
