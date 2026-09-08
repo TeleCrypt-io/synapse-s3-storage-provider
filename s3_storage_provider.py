@@ -449,7 +449,16 @@ def _stream_to_producer(reactor, producer, body, status=None, timeout=None):
             if not chunk:
                 return
 
-            reactor.callFromThread(producer._write, chunk)
+            write_done = threading.Event()
+
+            def write_chunk():
+                try:
+                    producer._write(chunk)
+                finally:
+                    write_done.set()
+
+            reactor.callFromThread(write_chunk)
+            write_done.wait()
 
     except Exception:
         producer._record_failure(Failure())
