@@ -15,8 +15,6 @@
 # limitations under the License.
 
 import logging
-import os
-import stat
 import threading
 
 import boto3
@@ -37,12 +35,6 @@ logger = logging.getLogger("synapse.s3")
 
 # Chunk size to use when reading from s3 connection in bytes
 READ_CHUNK_SIZE = 16 * 1024
-
-# Synapse's TeleCrypt runtime uses the fixed disk-backed staging mount for
-# upload payloads. The provider deliberately rejects the persistent
-# compatibility path and the ambient process temporary directory.
-MEDIA_STAGING_ROOT = "/staging"
-MEDIA_STAGING_DIRECTORY = "/staging/tmp"
 
 _REQUIRED_CONFIG_KEYS = frozenset(
     {
@@ -124,7 +116,7 @@ class S3StorageProviderBackend(StorageProvider):
 
         return await self._module_api.defer_to_threadpool(
             self._s3_pool,
-            _put_object_from_file,
+            _upload_file,
             self._get_s3_client(),
             self.bucket,
             path,
@@ -214,94 +206,12 @@ class S3StorageProviderBackend(StorageProvider):
         }
 
 
-def _put_object_from_file(s3_client, bucket, key, source_path):
-    """Upload one file with one ordinary S3 PutObject request.
-
-    ``upload_file`` is deliberately not used here: boto3's managed transfer
-    implementation may switch to multipart uploads for larger files. The
-    caller has already validated the source path and canonical key through
-    Synapse's storage-provider interface.
-    """
-
-    source_path = _validated_upload_source(source_path)
-    source = _open_validated_upload_source(source_path)
-    with source:
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=source,
-        )
-
-
-def _validated_upload_source(source_path):
-    """Return a real temporary source path beneath the fixed staging directory."""
+def _upload_file(s3_client, bucket, key, source_path):
+    """Upload the temporary file using boto3's standard managed transfer."""
 
     if not isinstance(source_path, str):
         raise ValueError("Synapse temporary media source path must be a string")
-
-    staging_root = os.path.realpath(MEDIA_STAGING_ROOT)
-    staging_directory = os.path.realpath(MEDIA_STAGING_DIRECTORY)
-    source = os.path.realpath(source_path)
-
-    try:
-        staging_is_valid = (
-            os.path.commonpath((staging_root, staging_directory)) == staging_root
-        )
-        source_is_staged = (
-            os.path.commonpath((staging_directory, source)) == staging_directory
-        )
-    except ValueError:
-        staging_is_valid = False
-        source_is_staged = False
-
-    if not staging_is_valid or not source_is_staged:
-        raise ValueError(
-            "Synapse temporary media source must be beneath /staging/tmp"
-        )
-    if not os.path.isfile(source):
-        raise ValueError("Synapse temporary media source does not exist")
-
-    return source
-
-
-def _open_validated_upload_source(source_path):
-    """Open a validated source and verify the object reached through the fd.
-
-    Path validation and opening are separate operations. If the path is
-    replaced between them, validating the path again would still leave a
-    time-of-check/time-of-use window. The descriptor is the upload authority:
-    inspect its resolved target before handing it to boto3, so a replacement
-    symlink or renamed path cannot redirect the bytes outside staging.
-    """
-
-    try:
-        # A replaced FIFO must reach the regular-file check without blocking.
-        file_descriptor = os.open(source_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
-    except FileNotFoundError:
-        raise ValueError("Synapse temporary media source does not exist") from None
-
-    try:
-        opened_path = os.path.realpath("/proc/self/fd/%d" % file_descriptor)
-        staging_directory = os.path.realpath(MEDIA_STAGING_DIRECTORY)
-        try:
-            is_staged = os.path.commonpath((staging_directory, opened_path)) == staging_directory
-        except ValueError:
-            is_staged = False
-        if not is_staged:
-            raise ValueError(
-                "Synapse temporary media source must be beneath /staging/tmp"
-            )
-        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
-            raise ValueError("Synapse temporary media source is not a regular file")
-        source = os.fdopen(file_descriptor, "rb")
-    except BaseException as error:
-        try:
-            os.close(file_descriptor)
-        except BaseException as close_error:
-            raise error from close_error
-        raise
-
-    return source
+    s3_client.upload_file(source_path, bucket, key)
 
 
 def _delete_object(s3_client, bucket, key):

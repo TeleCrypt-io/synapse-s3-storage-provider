@@ -24,12 +24,10 @@ from botocore.exceptions import ClientError
 from s3_storage_provider import (
     S3StorageProviderBackend,
     _delete_object,
-    _open_validated_upload_source,
     _ProducerStatus,
-    _put_object_from_file,
+    _upload_file,
     _S3Responder,
     _stream_to_producer,
-    _validated_upload_source,
     s3_download_task,
 )
 
@@ -39,262 +37,19 @@ from twisted.trial import unittest
 
 
 class S3ObjectOperationTestCase(unittest.TestCase):
-    def test_store_uses_one_put_object_from_the_given_source(self):
+    def test_store_uses_boto_managed_transfer(self):
         client = Mock()
-        observed = {}
-
-        def put_object(**kwargs):
-            observed.update(kwargs)
-            observed["body"] = kwargs["Body"].read()
-
-        client.put_object.side_effect = put_object
 
         with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            staging_media = os.path.join(staging, "media")
-            os.makedirs(staging_tmp)
-            os.makedirs(staging_media)
-            source_path = os.path.join(staging_tmp, "upload")
+            source_path = os.path.join(root, "upload")
             with open(source_path, "wb") as source:
                 source.write(b"temporary media")
 
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                _put_object_from_file(
-                    client,
-                    "media-bucket",
-                    "media/local/abc",
-                    source_path,
-                )
+            _upload_file(client, "media-bucket", "media/local/abc", source_path)
 
-            self.assertEqual(
-                os.path.commonpath((staging_tmp, source_path)), staging_tmp
-            )
-            self.assertNotEqual(
-                os.path.commonpath((staging_media, source_path)), staging_media
-            )
-
-        self.assertEqual(observed["Bucket"], "media-bucket")
-        self.assertEqual(observed["Key"], "media/local/abc")
-        self.assertEqual(observed["body"], b"temporary media")
-        client.put_object.assert_called_once()
-        client.upload_file.assert_not_called()
-
-    def test_exact_128_mib_uses_one_non_multipart_put_object(self):
-        client = Mock()
-        observed = {}
-        exact_size = 128 * 1024 * 1024
-
-        def put_object(**kwargs):
-            observed["size"] = os.fstat(kwargs["Body"].fileno()).st_size
-
-        client.put_object.side_effect = put_object
-
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            os.makedirs(staging_tmp)
-            source_path = os.path.join(staging_tmp, "exact-128-mib")
-            with open(source_path, "wb") as source:
-                source.truncate(exact_size)
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                _put_object_from_file(
-                    client,
-                    "media-bucket",
-                    "media/local/exact-128-mib",
-                    source_path,
-                )
-
-        self.assertEqual(observed["size"], exact_size)
-        client.put_object.assert_called_once()
-        client.upload_file.assert_not_called()
-        client.create_multipart_upload.assert_not_called()
-        client.upload_part.assert_not_called()
-        client.complete_multipart_upload.assert_not_called()
-        client.abort_multipart_upload.assert_not_called()
-
-    def test_retry_after_post_commit_error_reuses_exact_key(self):
-        client = Mock()
-        attempts = []
-
-        def put_object(**kwargs):
-            attempts.append((kwargs["Bucket"], kwargs["Key"], kwargs["Body"].read()))
-            if len(attempts) == 1:
-                # The object may already be durable when the response is lost. The
-                # caller's safe retry must therefore use the same exact key.
-                raise RuntimeError("response lost after object commit")
-
-        client.put_object.side_effect = put_object
-
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            os.makedirs(staging_tmp)
-            source_path = os.path.join(staging_tmp, "retry-upload")
-            with open(source_path, "wb") as source:
-                source.write(b"retry-safe media")
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                with self.assertRaisesRegex(RuntimeError, "response lost"):
-                    _put_object_from_file(
-                        client, "media-bucket", "media/local/retry", source_path
-                    )
-                _put_object_from_file(
-                    client, "media-bucket", "media/local/retry", source_path
-                )
-
-        self.assertEqual(attempts, [
-            ("media-bucket", "media/local/retry", b"retry-safe media"),
-            ("media-bucket", "media/local/retry", b"retry-safe media"),
-        ])
-        client.upload_file.assert_not_called()
-        client.create_multipart_upload.assert_not_called()
-        client.complete_multipart_upload.assert_not_called()
-        client.abort_multipart_upload.assert_not_called()
-
-    def test_rejects_source_in_persistent_media_compatibility_path(self):
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            staging_media = os.path.join(staging, "media")
-            os.makedirs(staging_tmp)
-            os.makedirs(staging_media)
-            source_path = os.path.join(staging_media, "upload")
-            with open(source_path, "wb") as source:
-                source.write(b"must not upload")
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
-                    _put_object_from_file(
-                        Mock(), "media-bucket", "media/local/abc", source_path
-                    )
-
-    def test_rejects_source_outside_staging_mount(self):
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            os.makedirs(staging_tmp)
-            source_path = os.path.join(root, "ambient-upload")
-            with open(source_path, "wb") as source:
-                source.write(b"must not upload")
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
-                    _validated_upload_source(source_path)
-
-    def test_rejects_staging_path_prefix_lookalike(self):
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            lookalike = os.path.join(staging, "tmp2")
-            os.makedirs(staging_tmp)
-            os.makedirs(lookalike)
-            source_path = os.path.join(lookalike, "upload")
-            with open(source_path, "wb") as source:
-                source.write(b"must not upload")
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
-                    _validated_upload_source(source_path)
-
-    def test_rejects_symlink_to_source_outside_staging_mount(self):
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            os.makedirs(staging_tmp)
-            outside_path = os.path.join(root, "outside-upload")
-            with open(outside_path, "wb") as source:
-                source.write(b"must not upload")
-            source_path = os.path.join(staging_tmp, "upload")
-            os.symlink(outside_path, source_path)
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
-                    _validated_upload_source(source_path)
-
-    def test_rejects_source_replaced_with_external_symlink_before_open(self):
-        with TemporaryDirectory() as root:
-            staging = os.path.join(root, "staging")
-            staging_tmp = os.path.join(staging, "tmp")
-            os.makedirs(staging_tmp)
-            outside_path = os.path.join(root, "outside-upload")
-            with open(outside_path, "wb") as source:
-                source.write(b"must not upload")
-            source_path = os.path.join(staging_tmp, "upload")
-            with open(source_path, "wb") as source:
-                source.write(b"temporary media")
-
-            original_open = os.open
-            replaced = False
-
-            def replace_before_open(path, flags):
-                nonlocal replaced
-                if path == source_path and not replaced:
-                    os.unlink(source_path)
-                    os.symlink(outside_path, source_path)
-                    replaced = True
-                return original_open(path, flags)
-
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ), patch("s3_storage_provider.os.open", side_effect=replace_before_open):
-                with self.assertRaisesRegex(ValueError, "beneath /staging/tmp"):
-                    _put_object_from_file(
-                        Mock(), "media-bucket", "media/local/abc", source_path
-                    )
-
-            self.assertTrue(replaced)
-
-    def test_preserves_validation_and_descriptor_close_failures(self):
-        source_path = "/staging/tmp/upload"
-        with patch(
-            "s3_storage_provider.os.open", return_value=42
-        ), patch(
-            "s3_storage_provider.os.path.realpath",
-            side_effect=[source_path, "/staging/tmp"],
-        ), patch(
-            "s3_storage_provider.os.fstat",
-            side_effect=RuntimeError("validation failed"),
-        ), patch(
-            "s3_storage_provider.os.close",
-            side_effect=OSError("close failed"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "validation failed") as raised:
-                _open_validated_upload_source(source_path)
-
-        self.assertIsNotNone(raised.exception.__cause__)
-        self.assertEqual(str(raised.exception.__cause__), "close failed")
+        client.upload_file.assert_called_once_with(
+            source_path, "media-bucket", "media/local/abc"
+        )
 
     def test_delete_uses_the_exact_key(self):
         client = Mock()
@@ -354,22 +109,17 @@ class S3BackendWiringTestCase(unittest.TestCase):
             with open(source_path, "wb") as source:
                 source.write(b"backend wiring")
 
-            with patch(
-                "s3_storage_provider.MEDIA_STAGING_ROOT", staging
-            ), patch(
-                "s3_storage_provider.MEDIA_STAGING_DIRECTORY", staging_tmp
-            ):
-                result = yield defer.ensureDeferred(
-                    backend.store_file(
-                        "local_content/aa/bb/exact-key",
-                        SimpleNamespace(upload_path=source_path),
-                    )
+            result = yield defer.ensureDeferred(
+                backend.store_file(
+                    "local_content/aa/bb/exact-key",
+                    SimpleNamespace(upload_path=source_path),
                 )
+            )
 
         self.assertIsNone(result)
         self.assertEqual(len(observed), 1)
         self.assertIs(observed[0][0], backend._s3_pool)
-        self.assertIs(observed[0][1], _put_object_from_file)
+        self.assertIs(observed[0][1], _upload_file)
         self.assertIs(observed[0][2], backend._s3_client)
         self.assertEqual(
             observed[0][3:],

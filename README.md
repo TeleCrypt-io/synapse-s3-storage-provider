@@ -40,21 +40,14 @@ This module uses `boto3`, and so the credentials should be specified as
 described [here](https://boto3.readthedocs.io/en/latest/guide/configuration.html#guide-configuration).
 
 TeleCrypt's pinned Synapse fork passes the disposable upload source through
-`FileInfo.upload_path`. The TeleCrypt release of this provider reads that path
-directly and performs one ordinary S3 `PutObject`; it does not use boto3's
-managed `upload_file` transfer or initiate multipart uploads. The optional
+`FileInfo.upload_path`. The provider passes that path to boto3's standard managed
+`upload_file` transfer. The optional
 storage-provider deletion hook deletes the exact canonical key and treats an
 already absent object as success.
 
-The upload source must resolve beneath the runtime's disk-backed
-`/staging/tmp` directory. The persistent compatibility path `/staging/media`,
-the process temporary directory, and symlinks that resolve outside staging are
-rejected before the object is written.
-
 Legacy asynchronous migration/cleanup tooling is intentionally absent from
 the TeleCrypt v1 package. It depended on a local media store, a separate
-database credential file, and managed multipart uploads, which conflict with
-v1's single synchronous `PutObject` path and disposable staging boundary.
+database credential file, and a second object lifecycle.
 Do not add a cleanup job or run an equivalent command against a v1 bucket.
 
 Packaging and release
