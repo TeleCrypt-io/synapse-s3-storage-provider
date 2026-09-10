@@ -25,9 +25,9 @@ from s3_storage_provider import (
     S3StorageProviderBackend,
     _delete_object,
     _ProducerStatus,
-    _upload_file,
     _S3Responder,
     _stream_to_producer,
+    _upload_file,
     s3_download_task,
 )
 
